@@ -3,6 +3,18 @@
 
 set -e
 
+
+echo "====== 开启 BBR ======"
+
+cat >> /etc/sysctl.conf <<EOF
+
+# BBR Optimization
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+sysctl -p
+
 echo "====== 安装 Xray ======"
 
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
