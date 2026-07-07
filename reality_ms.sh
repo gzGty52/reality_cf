@@ -29,9 +29,8 @@ echo "====== 生成 Reality 密钥 ======"
 
 KEYS=$(xray x25519)
 
-PRIVATE_KEY=$(echo "$KEYS" | grep PrivateKey | awk '{print $NF}')
-PUBLIC_KEY=$(echo "$KEYS" | grep Password | awk '{print $NF}')
-
+PRIVATE_KEY=$(echo "$KEYS" | grep PrivateKey | awk '{print $2}')
+PUBLIC_KEY=$(echo "$KEYS" | grep Password | awk -F': ' '{print $2}')
 
 echo "====== 生成 shortId ======"
 
