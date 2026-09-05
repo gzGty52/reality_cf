@@ -1,0 +1,700 @@
+#!/usr/bin/env bash
+#
+# 用法：
+#   bash reality.sh
+#   REALITY_PORT=443 REALITY_SERVER_NAME=speed.cloudflare.com bash reality.sh
+#   SKIP_TUNE=1 bash reality.sh
+
+set -Eeuo pipefail
+
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+META_FILE="/usr/local/etc/xray/reality-nodes.txt"
+DEFAULT_REALITY_SERVER_NAME="speed.cloudflare.com"
+SNI_DEFAULT="${REALITY_SERVER_NAME:-${DEFAULT_REALITY_SERVER_NAME}}"
+REALITY_SERVER_NAME="${SNI_DEFAULT}"
+REALITY_DEST_OVERRIDE="${REALITY_DEST:-}"
+REALITY_DEST="${REALITY_DEST_OVERRIDE:-${REALITY_SERVER_NAME}:443}"
+REALITY_PORT="${REALITY_PORT:-443}"
+LOCAL_PORT_BASE="${LOCAL_PORT_BASE:-4431}"
+SKIP_TUNE="${SKIP_TUNE:-0}"
+
+die() {
+    echo "错误：$*" >&2
+    exit 1
+}
+
+info() {
+    echo "====== $* ======"
+}
+
+if [[ "${EUID}" -ne 0 ]]; then
+    die "请使用 root 用户运行此脚本。"
+fi
+
+for command_name in curl openssl awk systemctl ip; do
+    command -v "${command_name}" >/dev/null 2>&1 || die "缺少命令：${command_name}"
+done
+
+# ---------- 公网 IPv4（排除回环 / RFC1918 / 链路本地 / CGNAT / 文档网段）----------
+is_public_ipv4() {
+    local ip="$1"
+    local a b c d
+    [[ "${ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a="${BASH_REMATCH[1]}"
+    b="${BASH_REMATCH[2]}"
+    c="${BASH_REMATCH[3]}"
+    d="${BASH_REMATCH[4]}"
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+    (( a == 198 && b == 51 && c == 100 )) && return 1
+    (( a == 203 && b == 0 && c == 113 )) && return 1
+    return 0
+}
+
+ip_on_host() {
+    local want="$1"
+    local found
+    found="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)"
+    grep -qx "${want}" <<<"${found}"
+}
+
+collect_local_public_ips() {
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' \
+        | cut -d/ -f1 \
+        | while read -r ip; do
+            is_public_ipv4 "${ip}" && echo "${ip}"
+        done \
+        | awk 'NF && !seen[$0]++'
+}
+
+fetch_egress_ip() {
+    curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "${s}"
+}
+
+is_valid_sni() {
+    local sni="$1"
+    (( ${#sni} <= 253 )) || return 1
+    [[ "${sni}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+select_sni() {
+    local input
+    while true; do
+        read -r -p "请输入 SNI（默认 ${SNI_DEFAULT}）: " input || input=""
+        input="${input//[[:space:]]/}"
+        REALITY_SERVER_NAME="${input:-${SNI_DEFAULT}}"
+        if is_valid_sni "${REALITY_SERVER_NAME}"; then
+            break
+        fi
+        echo "无效 SNI。请输入纯域名（例如 speed.cloudflare.com），不要包含协议、端口或路径。"
+    done
+
+    if [[ -n "${REALITY_DEST_OVERRIDE}" ]]; then
+        REALITY_DEST="${REALITY_DEST_OVERRIDE}"
+    else
+        REALITY_DEST="${REALITY_SERVER_NAME}:443"
+    fi
+}
+
+port_in_use() {
+    local port="$1"
+    local bind="${2:-}"
+    if command -v ss >/dev/null 2>&1; then
+        if [[ -n "${bind}" ]]; then
+            ss -lnt 2>/dev/null | awk -v p=":${port}" -v b="${bind}:${port}" '
+                NR > 1 {
+                    split($4, a, " ")
+                    if ($4 == b || $4 ~ p "$") found=1
+                }
+                END { exit found ? 0 : 1 }
+            ' && return 0
+        fi
+        ss -lnt 2>/dev/null | awk -v p=":${port}" 'NR>1 && $4 ~ p"$" {found=1} END{exit found?0:1}'
+        return $?
+    fi
+    return 1
+}
+
+parse_x25519() {
+    local keys="$1"
+    PRIVATE_KEY="$(awk -F':[[:space:]]*' '/Private[[:space:]]*[Kk]ey|PrivateKey/ {print $2; exit}' <<<"${keys}")"
+    PUBLIC_KEY="$(awk -F':[[:space:]]*' '/Public[[:space:]]*[Kk]ey|Password \(PublicKey\)|Password/ {print $2; exit}' <<<"${keys}")"
+    PRIVATE_KEY="$(echo "${PRIVATE_KEY}" | tr -d '[:space:]')"
+    PUBLIC_KEY="$(echo "${PUBLIC_KEY}" | tr -d '[:space:]')"
+    [[ -n "${PRIVATE_KEY}" ]] || die "无法从 xray x25519 输出中读取 PrivateKey。"
+    [[ -n "${PUBLIC_KEY}" ]] || die "无法从 xray x25519 输出中读取 PublicKey。"
+}
+
+# ---------- 检测 IP 并选择模式 ----------
+declare -a DETECTED_IPS=()
+mapfile -t DETECTED_IPS < <(collect_local_public_ips)
+
+EGRESS_IP="$(fetch_egress_ip || true)"
+
+echo
+info "检测本机公网 IPv4"
+if [[ "${#DETECTED_IPS[@]}" -eq 0 ]]; then
+    echo "网卡上未发现可用公网 IPv4（已排除 127/10/172.16-31/192.168/169.254/CGNAT/文档网段）。"
+    if [[ -n "${EGRESS_IP}" ]] && is_public_ipv4 "${EGRESS_IP}"; then
+        echo "出口探测地址：${EGRESS_IP}（不一定绑在网卡上，单 IP 模式可作节点地址）。"
+    else
+        echo "出口探测也失败。单 IP 模式仍可稍后手动指定。"
+    fi
+else
+    echo "网卡上的公网 IPv4（共 ${#DETECTED_IPS[@]} 个）："
+    for i in "${!DETECTED_IPS[@]}"; do
+        echo "  [$((i + 1))] ${DETECTED_IPS[$i]}"
+    done
+    if [[ -n "${EGRESS_IP}" ]]; then
+        echo "当前出口探测地址：${EGRESS_IP}"
+    fi
+fi
+echo
+
+MODE=""
+while [[ -z "${MODE}" ]]; do
+    echo "请选择安装模式："
+    echo "  1. 单 IP 模式（原版流程：0.0.0.0:${REALITY_PORT} → 127.0.0.1:${LOCAL_PORT_BASE}）"
+    echo "  2. 多 IP 模式（每个公网 IP 独立入站，并从该 IP 出站）"
+    echo "  0. 退出"
+    read -r -p "请输入选项 [0-2]: " MODE_CHOICE || MODE_CHOICE=0
+    case "${MODE_CHOICE}" in
+        1) MODE="single" ;;
+        2) MODE="multi" ;;
+        0) echo "已退出。"; exit 0 ;;
+        *) echo "无效选项。"; echo ;;
+    esac
+done
+echo
+
+declare -a IPS=()
+CLIENT_HOST=""
+
+select_single_ip() {
+    local choice ip
+    if [[ "${#DETECTED_IPS[@]}" -eq 1 ]]; then
+        IPS=("${DETECTED_IPS[0]}")
+        echo "单 IP 模式使用网卡地址：${IPS[0]}"
+        return
+    fi
+    if [[ "${#DETECTED_IPS[@]}" -gt 1 ]]; then
+        echo "检测到多个公网 IP。单 IP 模式只会把其中一个写进分享链接（入站仍监听全部网卡）。"
+        echo "  [0] 使用出口探测地址${EGRESS_IP:+（${EGRESS_IP}）}"
+        for i in "${!DETECTED_IPS[@]}"; do
+            echo "  [$((i + 1))] ${DETECTED_IPS[$i]}"
+        done
+        read -r -p "请选择写入分享链接的地址 [0-${#DETECTED_IPS[@]}]（回车=0）: " choice
+        choice="${choice:-0}"
+        if [[ "${choice}" == "0" ]]; then
+            if [[ -n "${EGRESS_IP}" ]] && is_public_ipv4 "${EGRESS_IP}"; then
+                IPS=("${EGRESS_IP}")
+            else
+                IPS=("${DETECTED_IPS[0]}")
+                echo "出口探测不可用，改用 ${IPS[0]}"
+            fi
+        elif [[ "${choice}" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DETECTED_IPS[@]} )); then
+            IPS=("${DETECTED_IPS[$((choice - 1))]}")
+        else
+            die "无效选择。"
+        fi
+        echo "分享链接将使用：${IPS[0]}"
+        return
+    fi
+    if [[ -n "${EGRESS_IP}" ]] && is_public_ipv4 "${EGRESS_IP}"; then
+        IPS=("${EGRESS_IP}")
+        echo "单 IP 模式使用出口地址：${IPS[0]}"
+        return
+    fi
+    read -r -p "未检测到公网 IP，请手动输入节点地址: " ip
+    ip="$(echo "${ip}" | tr -d '[:space:]')"
+    [[ -n "${ip}" ]] || die "未输入 IP。"
+    is_public_ipv4 "${ip}" || die "不是合法公网 IPv4：${ip}"
+    IPS=("${ip}")
+}
+
+select_multi_ips() {
+    local raw token idx ip
+    declare -a pool=("${DETECTED_IPS[@]}")
+
+    if [[ "${#pool[@]}" -lt 2 ]]; then
+        echo "网卡上可用公网 IPv4 不足 2 个，无法自动进入多 IP 模式。"
+        echo "可手动输入至少 2 个已绑定在本机网卡上的公网 IPv4（逗号分隔）。"
+        read -r -p "IP 列表: " raw
+        raw="$(echo "${raw}" | tr -d '[:space:]')"
+        [[ -n "${raw}" ]] || die "已取消。"
+        pool=()
+        IFS=',' read -r -a _manual <<< "${raw}"
+        for ip in "${_manual[@]}"; do
+            [[ -z "${ip}" ]] && continue
+            is_public_ipv4 "${ip}" || die "不是合法公网 IPv4：${ip}"
+            ip_on_host "${ip}" || die "${ip} 未出现在本机网卡上。请先在系统/面板绑定后再运行。"
+            pool+=("${ip}")
+        done
+        (( ${#pool[@]} >= 2 )) || die "多 IP 模式至少需要 2 个本机公网 IPv4。"
+        IPS=("${pool[@]}")
+        return
+    fi
+
+    echo "将为下列地址分别建立入站 / 出站："
+    for i in "${!pool[@]}"; do
+        echo "  [$((i + 1))] ${pool[$i]}"
+    done
+    echo
+    echo "输入序号，逗号分隔（例如 1,2）；直接回车 = 使用全部。"
+    echo "也可输入 IP 本身。多线路、不同网关时，仅 sendThrough 可能不够，需自行配策略路由。"
+    read -r -p "选择: " raw
+    if [[ -z "${raw}" ]]; then
+        IPS=("${pool[@]}")
+    else
+        raw="${raw// /}"
+        IFS=',' read -r -a tokens <<< "${raw}"
+        for token in "${tokens[@]}"; do
+            [[ -z "${token}" ]] && continue
+            if [[ "${token}" =~ ^[0-9]+$ ]]; then
+                idx=$((token - 1))
+                (( idx >= 0 && idx < ${#pool[@]} )) || die "序号超出范围：${token}"
+                IPS+=("${pool[$idx]}")
+            else
+                is_public_ipv4 "${token}" || die "不是合法公网 IPv4：${token}"
+                ip_on_host "${token}" || die "${token} 未出现在本机网卡上。"
+                IPS+=("${token}")
+            fi
+        done
+    fi
+
+    # 去重并再次确认都在网卡上
+    declare -a uniq=()
+    for ip in "${IPS[@]}"; do
+        grep -qx "${ip}" <<<"${uniq[*]// /$'\n'}" 2>/dev/null || true
+        local seen=0
+        for u in "${uniq[@]+"${uniq[@]}"}"; do
+            [[ "${u}" == "${ip}" ]] && seen=1 && break
+        done
+        (( seen == 0 )) && uniq+=("${ip}")
+    done
+    IPS=("${uniq[@]}")
+    (( ${#IPS[@]} >= 2 )) || die "多 IP 模式至少选择 2 个不同的公网 IPv4。"
+    for ip in "${IPS[@]}"; do
+        ip_on_host "${ip}" || die "${ip} 未出现在本机网卡上，无法 listen / sendThrough。"
+    done
+}
+
+if [[ "${MODE}" == "single" ]]; then
+    select_single_ip
+else
+    select_multi_ips
+fi
+
+echo
+select_sni
+
+echo
+info "将按 ${MODE} 模式配置 ${#IPS[@]} 个地址"
+echo "SNI: ${REALITY_SERVER_NAME}"
+echo "Reality target: ${REALITY_DEST}"
+for i in "${!IPS[@]}"; do
+    if [[ "${MODE}" == "multi" ]]; then
+        echo "  [$((i + 1))] ${IPS[$i]}  →  127.0.0.1:$((LOCAL_PORT_BASE + i))  sendThrough=${IPS[$i]}"
+    else
+        echo "  [$((i + 1))] 节点地址 ${IPS[$i]}  （入站 0.0.0.0:${REALITY_PORT} → 127.0.0.1:${LOCAL_PORT_BASE}）"
+    fi
+done
+echo
+read -r -p "确认继续？[Y/n] " CONFIRM
+CONFIRM="${CONFIRM:-Y}"
+[[ "${CONFIRM}" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 0; }
+
+# ---------- 安装 Xray ----------
+info "安装 Xray"
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
+command -v xray >/dev/null 2>&1 || die "Xray 安装失败，未找到 xray 命令。"
+
+info "生成 Reality 参数"
+declare -a UUIDS=() PRIVATES=() PUBLICS=() SHORTS=() LOCAL_PORTS=()
+
+if [[ "${MODE}" == "single" ]]; then
+    UUID="$(xray uuid)"
+    KEYS="$(xray x25519)"
+    parse_x25519 "${KEYS}"
+    SHORT_ID="$(openssl rand -hex 4)"
+    UUIDS+=("${UUID}")
+    PRIVATES+=("${PRIVATE_KEY}")
+    PUBLICS+=("${PUBLIC_KEY}")
+    SHORTS+=("${SHORT_ID}")
+    LOCAL_PORTS+=("${LOCAL_PORT_BASE}")
+else
+    for i in "${!IPS[@]}"; do
+        UUID="$(xray uuid)"
+        KEYS="$(xray x25519)"
+        parse_x25519 "${KEYS}"
+        SHORT_ID="$(openssl rand -hex 4)"
+        UUIDS+=("${UUID}")
+        PRIVATES+=("${PRIVATE_KEY}")
+        PUBLICS+=("${PUBLIC_KEY}")
+        SHORTS+=("${SHORT_ID}")
+        LOCAL_PORTS+=("$((LOCAL_PORT_BASE + i))")
+    done
+fi
+
+# 端口占用提示（不强制退出：旧 xray 正在听 443 时重启即可）
+if [[ "${MODE}" == "multi" ]]; then
+    for i in "${!IPS[@]}"; do
+        if port_in_use "${LOCAL_PORTS[$i]}" "127.0.0.1"; then
+            echo "提示：127.0.0.1:${LOCAL_PORTS[$i]} 当前已被占用，若不是即将重启的 xray，启动可能失败。"
+        fi
+    done
+fi
+
+write_single_config() {
+    local uuid pk sid
+    uuid="$(json_escape "${UUIDS[0]}")"
+    pk="$(json_escape "${PRIVATES[0]}")"
+    sid="$(json_escape "${SHORTS[0]}")"
+    cat >"${XRAY_CONFIG}" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "dokodemo-in",
+      "port": ${REALITY_PORT},
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": ${LOCAL_PORT_BASE},
+        "network": "tcp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "tls"
+        ],
+        "routeOnly": true
+      }
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": ${LOCAL_PORT_BASE},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": [
+            "${REALITY_SERVER_NAME}"
+          ],
+          "privateKey": "${pk}",
+          "shortIds": [
+            "${sid}"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "dokodemo-in"
+        ],
+        "domain": [
+          "${REALITY_SERVER_NAME}"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "inboundTag": [
+          "dokodemo-in"
+        ],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+EOF
+}
+
+write_multi_config() {
+    local i n ip uuid pk sid lport comma dtag vtag otag
+    n="${#IPS[@]}"
+    {
+        echo "{"
+        echo '  "log": { "loglevel": "warning" },'
+        echo '  "inbounds": ['
+        for i in "${!IPS[@]}"; do
+            ip="$(json_escape "${IPS[$i]}")"
+            uuid="$(json_escape "${UUIDS[$i]}")"
+            pk="$(json_escape "${PRIVATES[$i]}")"
+            sid="$(json_escape "${SHORTS[$i]}")"
+            lport="${LOCAL_PORTS[$i]}"
+            comma=","
+            (( i == n - 1 )) && comma=""
+            cat <<EOF
+    {
+      "tag": "dokodemo-ip$((i + 1))",
+      "listen": "${ip}",
+      "port": ${REALITY_PORT},
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": ${lport},
+        "network": "tcp"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["tls"],
+        "routeOnly": true
+      }
+    },
+    {
+      "tag": "vless-ip$((i + 1))",
+      "listen": "127.0.0.1",
+      "port": ${lport},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": ["${REALITY_SERVER_NAME}"],
+          "privateKey": "${pk}",
+          "shortIds": ["${sid}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
+    }${comma}
+EOF
+        done
+        echo "  ],"
+        echo '  "outbounds": ['
+        echo '    { "protocol": "freedom", "tag": "direct" },'
+        echo '    { "protocol": "blackhole", "tag": "block" },'
+        for i in "${!IPS[@]}"; do
+            ip="$(json_escape "${IPS[$i]}")"
+            comma=","
+            (( i == n - 1 )) && comma=""
+            echo "    { \"protocol\": \"freedom\", \"tag\": \"out-ip$((i + 1))\", \"sendThrough\": \"${ip}\" }${comma}"
+        done
+        echo "  ],"
+        echo '  "routing": {'
+        echo '    "domainStrategy": "AsIs",'
+        echo '    "rules": ['
+        echo -n '      { "inboundTag": ['
+        for i in "${!IPS[@]}"; do
+            (( i > 0 )) && echo -n ", "
+            echo -n "\"dokodemo-ip$((i + 1))\""
+        done
+        echo "], \"domain\": [\"${REALITY_SERVER_NAME}\"], \"outboundTag\": \"direct\" },"
+        echo -n '      { "inboundTag": ['
+        for i in "${!IPS[@]}"; do
+            (( i > 0 )) && echo -n ", "
+            echo -n "\"dokodemo-ip$((i + 1))\""
+        done
+        echo '], "outboundTag": "block" },'
+        for i in "${!IPS[@]}"; do
+            comma=","
+            (( i == n - 1 )) && comma=""
+            echo "      { \"inboundTag\": [\"vless-ip$((i + 1))\"], \"outboundTag\": \"out-ip$((i + 1))\" }${comma}"
+        done
+        echo "    ]"
+        echo "  }"
+        echo "}"
+    } >"${XRAY_CONFIG}"
+}
+
+info "写入 Xray 配置"
+install -d -m 0755 "$(dirname "${XRAY_CONFIG}")"
+if [[ -f "${XRAY_CONFIG}" ]]; then
+    cp -a "${XRAY_CONFIG}" "${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    echo "已备份旧配置。"
+fi
+
+if [[ "${MODE}" == "single" ]]; then
+    write_single_config
+else
+    write_multi_config
+fi
+
+info "检查并启动 Xray"
+xray run -test -config "${XRAY_CONFIG}" || die "配置检测失败，请查看 ${XRAY_CONFIG}"
+systemctl daemon-reload
+systemctl enable xray >/dev/null 2>&1 || true
+systemctl restart xray
+sleep 1
+systemctl is-active --quiet xray || die "Xray 启动失败，请运行 journalctl -u xray -n 80 查看日志。"
+
+# ---------- 输出客户端参数 ----------
+echo
+if [[ "${MODE}" == "single" ]]; then
+    CLIENT_HOST="${IPS[0]}"
+    if [[ "${CLIENT_HOST}" == *:* ]]; then
+        CLIENT_HOST="[${CLIENT_HOST}]"
+    fi
+    LINK="vless://${UUIDS[0]}@${CLIENT_HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_SERVER_NAME}&fp=safari&pbk=${PUBLICS[0]}&sid=${SHORTS[0]}&type=tcp&flow=xtls-rprx-vision#Reality"
+    echo "===== Reality 节点安装完成（单 IP）====="
+    echo
+    echo "地址: ${IPS[0]}"
+    echo "端口: ${REALITY_PORT}"
+    echo "UUID: ${UUIDS[0]}"
+    echo "PublicKey: ${PUBLICS[0]}"
+    echo "ShortId: ${SHORTS[0]}"
+    echo "SNI: ${REALITY_SERVER_NAME}"
+    echo "Flow: xtls-rprx-vision"
+    echo
+    echo "Reality 分享链接:"
+    echo "${LINK}"
+    echo
+    {
+        echo "# generated $(date -Is) mode=single"
+        echo "IP=${IPS[0]}"
+        echo "UUID=${UUIDS[0]}"
+        echo "PublicKey=${PUBLICS[0]}"
+        echo "PrivateKey=${PRIVATES[0]}"
+        echo "ShortId=${SHORTS[0]}"
+        echo "LINK=${LINK}"
+    } >"${META_FILE}"
+else
+    echo "===== Reality 节点安装完成（多 IP 分离，${#IPS[@]} 条）====="
+    echo "SNI/dest: ${REALITY_SERVER_NAME} / ${REALITY_DEST}"
+    echo "Flow: xtls-rprx-vision"
+    echo "端口: ${REALITY_PORT}"
+    echo "每个 IP 使用独立 UUID / 密钥，不能把 A 的链接改个地址当 B 用。"
+    echo
+    {
+        echo "# generated $(date -Is) mode=multi"
+        echo "# serverNames=${REALITY_SERVER_NAME} dest=${REALITY_DEST} port=${REALITY_PORT}"
+    } >"${META_FILE}"
+    for i in "${!IPS[@]}"; do
+        ip="${IPS[$i]}"
+        name="Reality-${ip}"
+        link="vless://${UUIDS[$i]}@${ip}:${REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_SERVER_NAME}&fp=safari&pbk=${PUBLICS[$i]}&sid=${SHORTS[$i]}&type=tcp&flow=xtls-rprx-vision#${name}"
+        echo "---------- IP #$((i + 1)): ${ip} ----------"
+        echo "本机 Reality: 127.0.0.1:${LOCAL_PORTS[$i]}"
+        echo "出站 sendThrough: ${ip}"
+        echo "UUID: ${UUIDS[$i]}"
+        echo "PublicKey: ${PUBLICS[$i]}"
+        echo "ShortId: ${SHORTS[$i]}"
+        echo "分享链接:"
+        echo "${link}"
+        echo
+        {
+            echo
+            echo "IP=${ip}"
+            echo "UUID=${UUIDS[$i]}"
+            echo "PublicKey=${PUBLICS[$i]}"
+            echo "PrivateKey=${PRIVATES[$i]}"
+            echo "ShortId=${SHORTS[$i]}"
+            echo "LocalPort=${LOCAL_PORTS[$i]}"
+            echo "LINK=${link}"
+        } >>"${META_FILE}"
+    done
+fi
+chmod 600 "${META_FILE}"
+echo "节点参数已保存: ${META_FILE}"
+echo
+echo "监听核对："
+if command -v ss >/dev/null 2>&1; then
+    ss -lntp 2>/dev/null | grep -E ":(${REALITY_PORT}|${LOCAL_PORT_BASE})\\b" || true
+    if [[ "${MODE}" == "multi" && "${#IPS[@]}" -gt 1 ]]; then
+        ss -lntp 2>/dev/null | grep -E ":$((LOCAL_PORT_BASE + 1))\\b" || true
+    fi
+fi
+echo
+
+simple_tuning() {
+    info "执行简易调优"
+    cat >/etc/sysctl.d/99-bbr.conf <<'EOF'
+# BBR Optimization
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
+    echo
+    echo "简易调优完成。"
+    sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control 2>/dev/null || true
+}
+
+dynamic_tuning() {
+    info "执行动态调优"
+    bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
+}
+
+if [[ "${SKIP_TUNE}" == "1" ]]; then
+    echo "SKIP_TUNE=1，跳过调优菜单。"
+    exit 0
+fi
+
+while true; do
+    echo "请选择后续操作："
+    echo "1. 简易调优"
+    echo "2. 动态调优"
+    echo "0. 退出"
+    read -r -p "请输入选项 [0-2]: " CHOICE || CHOICE=0
+    case "${CHOICE}" in
+        1) simple_tuning; break ;;
+        2) dynamic_tuning; break ;;
+        0) echo "已退出。"; break ;;
+        *) echo "无效选项，请重新输入。"; echo ;;
+    esac
+done
