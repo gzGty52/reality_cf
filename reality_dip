@@ -677,7 +677,31 @@ EOF
 
 dynamic_tuning() {
     info "执行动态调优"
-    bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
+
+    local node_snapshot rc
+    node_snapshot="$(mktemp)"
+
+    if [[ -f "${META_FILE}" ]]; then
+        grep -vE '^(#|PrivateKey=)' "${META_FILE}" >"${node_snapshot}" || true
+    fi
+
+    if bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh); then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    echo
+    info "恢复 Reality/VLESS 节点信息"
+
+    if [[ -s "${node_snapshot}" ]]; then
+        cat "${node_snapshot}"
+    else
+        echo "未找到节点信息文件：${META_FILE}"
+    fi
+
+    rm -f "${node_snapshot}"
+    return "${rc}"
 }
 
 if [[ "${SKIP_TUNE}" == "1" ]]; then
