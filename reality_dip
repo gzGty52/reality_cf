@@ -320,7 +320,7 @@ CONFIRM="${CONFIRM:-Y}"
 # ---------- 安装 Xray ----------
 info "安装 Xray"
 curl -fsSL -o /tmp/xray-install.sh https://github.com/XTLS/Xray-install/raw/main/install-release.sh
-bash /tmp/xray-install.sh install -u root
+bash /tmp/xray-install.sh install
 rm -f /tmp/xray-install.sh
 command -v xray >/dev/null 2>&1 || die "Xray 安装失败，未找到 xray 命令。"
 
